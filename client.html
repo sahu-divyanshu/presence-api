@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Live Presence Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; }
+    h1 { font-size: 1.8rem; margin-bottom: 6px; background: linear-gradient(90deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 32px; }
+    #conn-bar { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; margin-bottom: 28px; }
+    #conn-bar.connecting { background: #1e293b; color: #94a3b8; }
+    #conn-bar.connected  { background: #052e16; color: #4ade80; }
+    #conn-bar.disconnected { background: #2d1515; color: #f87171; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .connecting .dot { background: #94a3b8; }
+    .connected .dot { background: #4ade80; animation: pulse 1.4s infinite; }
+    .disconnected .dot { background: #f87171; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+    .layout { display: grid; grid-template-columns: 360px 360px; gap: 24px; width: 100%; max-width: 760px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; }
+    .card h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 16px; }
+    .input-row { display: flex; gap: 8px; margin-bottom: 12px; }
+    input[type="text"] { flex: 1; background: #0f1117; border: 1px solid #334155; border-radius: 8px; padding: 9px 14px; color: #e2e8f0; font-size: 0.9rem; outline: none; }
+    button { padding: 9px 18px; border-radius: 8px; border: none; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-sm { padding: 6px 12px; font-size: 0.78rem; }
+    .hint { font-size: 0.75rem; color: #475569; margin-top: 6px; }
+    #user-list { display: flex; flex-direction: column; gap: 10px; min-height: 60px; }
+    .user-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #0f1117; border-radius: 10px; border: 1px solid #1e293b; }
+    .status-pill { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; }
+    .status-pill.online { background: #052e16; color: #4ade80; }
+    .status-pill.offline { background: #1c1917; color: #78716c; }
+    .status-pill .dot { width: 7px; height: 7px; }
+    .status-pill.online .dot { background: #4ade80; animation: pulse 1.4s infinite; }
+    .status-pill.offline .dot { background: #78716c; }
+    #event-log { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+    .log-entry { font-size: 0.8rem; padding: 7px 12px; border-radius: 8px; display: flex; align-items: center; gap: 8px; }
+    .log-entry.online  { background: #052e16; border-left: 3px solid #4ade80; }
+    .log-entry.offline { background: #1c1917; border-left: 3px solid #78716c; }
+    .log-entry.system  { background: #172554; border-left: 3px solid #60a5fa; }
+    .log-time { color: #475569; white-space: nowrap; }
+    .empty-state { color: #475569; font-size: 0.85rem; text-align: center; padding: 20px 0; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body>
+<h1>Live Presence Dashboard</h1>
+<p class="subtitle">Real-time push via WebSocket — no polling</p>
+<div id="conn-bar" class="connecting"><div class="dot"></div><span id="conn-label">Connecting...</span></div>
+<div class="layout">
+  <div class="card">
+    <h2>Simulate Heartbeat</h2>
+    <div class="input-row">
+      <input type="text" id="user-input" placeholder="user_id  e.g. alice" />
+      <button class="btn-primary" onclick="sendHeartbeat()">Send</button>
+    </div>
+    <p class="hint">POST /heartbeat → Valkey SETEX 30s → pub/sub → WebSocket PUSH</p>
+    <div style="margin-top:20px;"><h2>Quick fire</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
+        <button class="btn-sm btn-primary" onclick="quickbeat('alice')">alice</button>
+        <button class="btn-sm btn-primary" onclick="quickbeat('bob')">bob</button>
+        <button class="btn-sm btn-primary" onclick="quickbeat('carol')">carol</button>
+        <button class="btn-sm btn-primary" onclick="quickbeat('dave')">dave</button>
+      </div>
+      <p class="hint" style="margin-top:8px;">After 30 s inactivity Valkey key expires → offline push fires automatically</p>
+    </div>
+  </div>
+  <div class="card">
+    <h2>User Presence</h2>
+    <div id="user-list"><p class="empty-state">No users yet — send a heartbeat</p></div>
+  </div>
+  <div class="card" style="grid-column:1/-1;">
+    <h2>Event Log</h2>
+    <div id="event-log"><p class="empty-state">Waiting for events...</p></div>
+  </div>
+</div>
+<script>
+  const API = 'http://localhost:8000';
+  const WS  = 'ws://localhost:8000/ws/status';
+  const users = {};
+  let ws;
+
+  function connect() {
+    setBar('connecting','Connecting...');
+    ws = new WebSocket(WS);
+    ws.onopen = () => { setBar('connected','Connected — live push active'); log('system','WebSocket connected'); setInterval(()=>{if(ws.readyState===1)ws.send('ping')},20000); };
+    ws.onmessage = e => { try { const {user_id,status}=JSON.parse(e.data); if(user_id&&status)update(user_id,status); } catch{} };
+    ws.onclose = () => { setBar('disconnected','Disconnected — retrying in 3 s'); log('system','Reconnecting...'); setTimeout(connect,3000); };
+    ws.onerror = () => ws.close();
+  }
+
+  function update(uid, status) {
+    const prev = users[uid];
+    users[uid] = status;
+    renderUsers();
+    if(prev!==status) log(status, uid+' is now '+status);
+  }
+
+  function renderUsers() {
+    const el = document.getElementById('user-list');
+    const e = Object.entries(users);
+    if(!e.length){el.innerHTML='<p class="empty-state">No users yet</p>';return;}
+    el.innerHTML = e.sort(([a],[b])=>a.localeCompare(b)).map(([uid,st])=>
+      '<div class="user-row" style="animation:fadeIn .25s ease"><span>'+uid+'</span><span class="status-pill '+st+'"><span class="dot"></span>'+st+'</span></div>'
+    ).join('');
+  }
+
+  function log(type, msg) {
+    const el = document.getElementById('event-log');
+    if(el.querySelector('.empty-state')) el.innerHTML='';
+    const icon = type==='online'?'🟢':type==='offline'?'⚫':'🔵';
+    const d = document.createElement('div');
+    d.className='log-entry '+type;
+    d.innerHTML='<span class="log-time">'+new Date().toLocaleTimeString()+'</span>'+icon+' '+msg;
+    el.prepend(d);
+    while(el.children.length>50) el.removeChild(el.lastChild);
+  }
+
+  function setBar(s,l){document.getElementById('conn-bar').className=s;document.getElementById('conn-label').textContent=l;}
+
+  async function sendHeartbeat() {
+    const inp = document.getElementById('user-input');
+    const uid = inp.value.trim(); if(!uid) return; inp.value='';
+    await postHeartbeat(uid);
+  }
+  async function quickbeat(uid){await postHeartbeat(uid);}
+  async function postHeartbeat(uid){
+    try{const r=await fetch(API+'/heartbeat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid})});if(!r.ok)throw new Error('HTTP '+r.status);}
+    catch(e){log('system','Heartbeat failed: '+e.message);}
+  }
+
+  document.getElementById('user-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendHeartbeat();});
+  connect();
+</script>
+</body>
+</html>
