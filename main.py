@@ -1,18 +1,23 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import redis.asyncio as redis
+import aio_pika
 import asyncio
 import json
-from typing import Dict, Set
+from datetime import datetime, timezone
+from typing import Dict, Set, Optional
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Presence API with Real-time WebSocket Push")
+app = FastAPI(title="Presence API — Phase 1 + 2")
+
+RABBITMQ_URL  = "amqp://guest:guest@localhost:5672/"
+ACTIVITY_QUEUE = "user_activity_logs"
 
 # ---------------------------------------------------------------------------
-# Connection pool (reused for normal HTTP requests)
+# Valkey (Redis-compatible) connection pool
 # ---------------------------------------------------------------------------
 pool = redis.ConnectionPool.from_url(
     "redis://localhost:6379/0",
@@ -21,13 +26,58 @@ pool = redis.ConnectionPool.from_url(
 )
 valkey_client = redis.Redis(connection_pool=pool)
 
+# ---------------------------------------------------------------------------
+# RabbitMQ — one connection + one channel shared across all requests
+# (aio-pika channels are NOT thread-safe but are coroutine-safe)
+# ---------------------------------------------------------------------------
+rabbitmq_connection: Optional[aio_pika.abc.AbstractRobustConnection] = None
+rabbitmq_channel:    Optional[aio_pika.abc.AbstractChannel]           = None
+
+
+async def get_rabbitmq_channel() -> aio_pika.abc.AbstractChannel:
+    """Return the shared channel, reconnecting if it was closed."""
+    global rabbitmq_connection, rabbitmq_channel
+    if rabbitmq_connection is None or rabbitmq_connection.is_closed:
+        rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+        rabbitmq_channel    = await rabbitmq_connection.channel()
+        # Declare the queue so it exists even if the worker hasn't started yet.
+        # durable=True means the queue survives a RabbitMQ restart.
+        await rabbitmq_channel.declare_queue(ACTIVITY_QUEUE, durable=True)
+        logger.info("RabbitMQ channel ready")
+    return rabbitmq_channel
+
+
+async def publish_activity(user_id: str, event: str) -> None:
+    """
+    Fire-and-forget: push a JSON message onto the user_activity_logs queue.
+
+    FastAPI never waits for the worker to process it — it returns success
+    to the caller immediately after the publish call returns.
+
+    delivery_mode=PERSISTENT tells RabbitMQ to write the message to disk
+    so it is not lost if the broker restarts before the worker consumes it.
+    """
+    message_body = {
+        "user_id":   user_id,
+        "event":     event,                                    # connected | disconnected | heartbeat
+        "timestamp": datetime.now(timezone.utc).isoformat(),  # ISO-8601 UTC
+    }
+    channel = await get_rabbitmq_channel()
+    await channel.default_exchange.publish(
+        aio_pika.Message(
+            body=json.dumps(message_body).encode(),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            content_type="application/json",
+        ),
+        routing_key=ACTIVITY_QUEUE,
+    )
+    logger.info("→ MQ published  : %s", message_body)
+
 
 # ---------------------------------------------------------------------------
 # WebSocket connection manager
 # ---------------------------------------------------------------------------
 class ConnectionManager:
-    """Tracks every open WebSocket and fans-out broadcast messages."""
-
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
 
@@ -41,7 +91,6 @@ class ConnectionManager:
         logger.info("WS client disconnected | total=%d", len(self.active_connections))
 
     async def broadcast(self, message: dict):
-        """Push JSON to every live client; silently drop dead sockets."""
         dead: Set[WebSocket] = set()
         for ws in self.active_connections:
             try:
@@ -55,7 +104,7 @@ manager = ConnectionManager()
 
 
 # ---------------------------------------------------------------------------
-# Pydantic model
+# Pydantic models
 # ---------------------------------------------------------------------------
 class HeartbeatRequest(BaseModel):
     user_id: str
@@ -67,20 +116,26 @@ class HeartbeatRequest(BaseModel):
 @app.post("/heartbeat")
 async def update_heartbeat(request: HeartbeatRequest):
     """
-    Mark a user as online for 30 s.
-    Also publishes to 'presence:updates' so every WebSocket client
-    gets the ONLINE event immediately — no polling.
+    1. Set presence key in Valkey (30 s TTL).
+    2. Publish ONLINE event to Valkey pub/sub → WebSocket push.
+    3. Publish 'heartbeat' activity to RabbitMQ → worker logs it to Postgres.
+    Returns immediately — the DB write happens asynchronously in the worker.
     """
     try:
+        # --- Valkey: presence + real-time push (Phase 1) ---
         await valkey_client.setex(f"presence:{request.user_id}", 30, "1")
         await valkey_client.publish(
             "presence:updates",
             json.dumps({"user_id": request.user_id, "status": "online"}),
         )
+
+        # --- RabbitMQ: async activity log (Phase 2) ---
+        await publish_activity(request.user_id, "heartbeat")
+
         return {"status": "success"}
     except Exception as exc:
         logger.exception("Heartbeat error: %s", exc)
-        raise HTTPException(status_code=500, detail="Database error")
+        raise HTTPException(status_code=500, detail="Internal error")
 
 
 @app.get("/status/users")
@@ -97,7 +152,7 @@ async def get_users_status(ids: str) -> Dict[str, str]:
         }
     except Exception as exc:
         logger.exception("Status error: %s", exc)
-        raise HTTPException(status_code=500, detail="Database error")
+        raise HTTPException(status_code=500, detail="Internal error")
 
 
 # ---------------------------------------------------------------------------
@@ -106,40 +161,37 @@ async def get_users_status(ids: str) -> Dict[str, str]:
 @app.websocket("/ws/status")
 async def websocket_status(websocket: WebSocket):
     """
-    Connect once — receive PUSH events forever.
-    The server pushes {"user_id": "...", "status": "online"|"offline"}
-    the instant a user's state changes. Zero polling.
+    Phase 1  — push Valkey presence events to this client.
+    Phase 2  — log connect / disconnect events to RabbitMQ for the worker.
     """
+    # Extract an optional user_id from query params: ws://host/ws/status?user_id=alice
+    user_id = websocket.query_params.get("user_id", "anonymous")
+
     await manager.connect(websocket)
+
+    # Publish "connected" activity — FastAPI does NOT write to Postgres directly
+    await publish_activity(user_id, "connected")
+
     try:
         while True:
             data = await websocket.receive_text()
             if data.strip() == "ping":
-                await websocket.send_text("pong")   # keep NAT/proxy alive
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+        # Publish "disconnected" activity
+        await publish_activity(user_id, "disconnected")
 
 
 # ---------------------------------------------------------------------------
-# Background pub/sub listener — bridges Valkey events → WebSocket push
+# Background Valkey pub/sub listener (Phase 1 — unchanged)
 # ---------------------------------------------------------------------------
 async def listen_to_pubsub():
-    """
-    Runs forever alongside the app.
-
-    Subscribes to:
-      • presence:updates          — published by /heartbeat (user ONLINE)
-      • __keyevent@0__:expired    — Valkey fires this when a TTL key expires
-                                    (no heartbeat received → user OFFLINE)
-    """
     logger.info("Starting Valkey pub/sub listener…")
     pubsub_client = redis.Redis.from_url(
         "redis://localhost:6379/0", decode_responses=True
     )
-
-    # Enable keyspace notifications: K=keyspace, E=keyevent, x=expired
     await pubsub_client.config_set("notify-keyspace-events", "KEx")
-
     pubsub = pubsub_client.pubsub()
     await pubsub.subscribe("presence:updates", "__keyevent@0__:expired")
     logger.info("Subscribed to presence:updates + keyevent @expired")
@@ -147,9 +199,8 @@ async def listen_to_pubsub():
     async for message in pubsub.listen():
         if message["type"] != "message":
             continue
-
         channel: str = message["channel"]
-        data: str = message["data"]
+        data: str    = message["data"]
 
         if channel == "presence:updates":
             try:
@@ -160,10 +211,9 @@ async def listen_to_pubsub():
                 logger.warning("Bad JSON on presence:updates: %s", data)
 
         elif channel == "__keyevent@0__:expired":
-            # data = expired key name, e.g. "presence:alice"
             if data.startswith("presence:"):
-                user_id = data[len("presence:"):]
-                payload = {"user_id": user_id, "status": "offline"}
+                uid = data[len("presence:"):]
+                payload = {"user_id": uid, "status": "offline"}
                 logger.info("→ PUSH offline : %s", payload)
                 await manager.broadcast(payload)
 
@@ -173,10 +223,15 @@ async def listen_to_pubsub():
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
+    # Warm up RabbitMQ connection so the first request is not slow
+    await get_rabbitmq_channel()
     asyncio.create_task(listen_to_pubsub())
-    logger.info("Presence API ready — WebSocket push enabled")
+    logger.info("Presence API ready — Phase 1 (WebSocket push) + Phase 2 (MQ) active")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await valkey_client.aclose()
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        await rabbitmq_connection.close()
+        logger.info("RabbitMQ connection closed")
